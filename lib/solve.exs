@@ -154,9 +154,13 @@ defmodule FastParser do
   end
 
   defp update(acc, key, temp) do
-    Map.update(acc, key, {temp, temp, 1, temp}, fn {min, max, count, sum} ->
-      {min(min, temp), max(max, temp), count + 1, sum + temp}
-    end)
+    case acc do
+      %{^key => {min, max, count, sum}} ->
+        %{acc | key => {min(min, temp), max(max, temp), count + 1, sum + temp}}
+
+      _ ->
+        Map.put(acc, :binary.copy(key), {temp, temp, 1, temp})
+    end
   end
 
   defp digit(c), do: c - ?0
