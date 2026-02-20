@@ -419,6 +419,8 @@ defmodule Onebtc.Data do
 end
 
 defmodule Onebtc.CreateMeasurements do
+  @moduledoc "Strategy: naive — one IO.puts per line"
+
   defp measurement_file(count), do: "./data/measurements.#{count}.txt"
 
   def run(args) do
@@ -430,33 +432,32 @@ defmodule Onebtc.CreateMeasurements do
     count = Keyword.get(opts, :count, 1000)
     cities = Onebtc.Data.city() |> Map.to_list()
 
+    IO.puts("Strategy: naive (1 write per line)")
+    IO.puts("Count: #{count}")
+    IO.puts("Schedulers: #{System.schedulers_online()}")
+    IO.puts("---")
+
     start = System.monotonic_time(:millisecond)
 
     File.mkdir_p!("./data")
     file = File.open!(measurement_file(count), [:write, :utf8])
 
-    1..count
-    |> Stream.chunk_every(10_000)
-    |> Task.async_stream(fn chunk ->
-      Enum.map(chunk, fn _ ->
-        Enum.random(cities)
-        |> rand_temp()
-        |> format_line()
+    {gen_us, :ok} = :timer.tc(fn ->
+      Enum.each(1..count, fn _ ->
+        {city, avg} = Enum.random(cities)
+        temp = avg - 10.0 + :rand.uniform() * 20.0
+        IO.puts(file, "#{city};#{Float.round(temp, 1)}")
       end)
-    end, max_concurrency: System.schedulers_online(), ordered: false, timeout: :infinity)
-    |> Enum.each(fn {:ok, lines} -> IO.write(file, lines) end)
+    end)
 
     File.close(file)
 
     elapsed = System.monotonic_time(:millisecond) - start
-    IO.puts("Generated #{count} measurements in #{measurement_file(count)} (#{elapsed}ms)")
+    IO.puts("---")
+    IO.puts("Generate + Write: #{div(gen_us, 1000)}ms")
+    IO.puts("Total:            #{elapsed}ms")
+    IO.puts("File: #{measurement_file(count)}")
   end
-
-  defp rand_temp({city, avg}) do
-    temp = avg - 10.0 + :rand.uniform() * 20.0
-    {city, temp}
-  end
-  defp format_line({city, temp}), do: "#{city};#{Float.round(temp, 1)}\n"
 end
 
 Onebtc.CreateMeasurements.run(System.argv())
