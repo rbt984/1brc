@@ -1,8 +1,30 @@
 # Parse args
-{opts, _} = OptionParser.parse!(System.argv(), strict: [file: :string])
+{opts, _} = OptionParser.parse!(System.argv(), strict: [file: :string, profile: :boolean])
 file = opts[:file] || "data/measurements.1000000000.txt"
+profile? = opts[:profile] || false
+started_at = System.monotonic_time()
 
 chunk_size = 1_048_576  # 1 MB chunks
+
+defmodule Prof do
+  def now, do: System.monotonic_time()
+
+  def elapsed_ms(started_at), do: elapsed_ms_between(started_at, System.monotonic_time())
+
+  def elapsed_ms_between(started_at, finished_at),
+    do: System.convert_time_unit(finished_at - started_at, :native, :millisecond)
+
+  def snapshot do
+    %{
+      gc: :erlang.statistics(:garbage_collection),
+      mem_total: :erlang.memory(:total),
+      mem_processes: :erlang.memory(:processes),
+      mem_binary: :erlang.memory(:binary)
+    }
+  end
+
+  def mb(bytes), do: :erlang.float_to_binary(bytes / 1_048_576, decimals: 2)
+end
 
 # Parse temperature from binary — avoids Float.parse overhead
 # Input: "15.4" or "-2.3" — always exactly 1 decimal place
@@ -64,6 +86,9 @@ defmodule Chunker do
 end
 
 # Process chunks in parallel, each returns a local map, merge at end
+profile_before = if profile?, do: Prof.snapshot(), else: nil
+compute_started_at = Prof.now()
+
 result =
   Chunker.stream(file, chunk_size)
   |> Task.async_stream(
@@ -93,6 +118,9 @@ result =
   end)
 
 # Format output
+compute_finished_at = Prof.now()
+format_started_at = compute_finished_at
+
 output =
   result
   |> Enum.sort_by(fn {city, _} -> city end)
@@ -102,4 +130,30 @@ output =
   end)
   |> Enum.join(", ")
 
+format_finished_at = Prof.now()
+compute_ms = Prof.elapsed_ms_between(compute_started_at, compute_finished_at)
+format_ms = Prof.elapsed_ms_between(format_started_at, format_finished_at)
+
 IO.puts("{#{output}}")
+
+elapsed_ms =
+  Prof.elapsed_ms(started_at)
+
+IO.puts(:stderr, "Elapsed: #{elapsed_ms} ms")
+
+if profile? do
+  profile_after = Prof.snapshot()
+
+  IO.puts(:stderr, "Profile:")
+  IO.puts(:stderr, "  compute_and_merge_ms: #{compute_ms}")
+  IO.puts(:stderr, "  sort_and_format_ms: #{format_ms}")
+  IO.puts(:stderr, "  total_ms: #{elapsed_ms}")
+  IO.puts(:stderr, "  memory_total_mb_before: #{Prof.mb(profile_before.mem_total)}")
+  IO.puts(:stderr, "  memory_total_mb_after: #{Prof.mb(profile_after.mem_total)}")
+  IO.puts(:stderr, "  memory_processes_mb_before: #{Prof.mb(profile_before.mem_processes)}")
+  IO.puts(:stderr, "  memory_processes_mb_after: #{Prof.mb(profile_after.mem_processes)}")
+  IO.puts(:stderr, "  memory_binary_mb_before: #{Prof.mb(profile_before.mem_binary)}")
+  IO.puts(:stderr, "  memory_binary_mb_after: #{Prof.mb(profile_after.mem_binary)}")
+  IO.puts(:stderr, "  gc_before: #{inspect(profile_before.gc)}")
+  IO.puts(:stderr, "  gc_after: #{inspect(profile_after.gc)}")
+end
