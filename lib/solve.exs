@@ -58,6 +58,110 @@ defmodule Format do
   end
 end
 
+defmodule FastParser do
+  def parse_chunk(bin, acc), do: parse_lines(bin, acc)
+
+  def flush_tail(<<>>, acc), do: acc
+
+  def flush_tail(bin, acc) do
+    case parse_line_no_nl(bin) do
+      {:ok, key, temp} -> update(acc, key, temp)
+      :error -> acc
+    end
+  end
+
+  defp parse_lines(<<>>, acc), do: {<<>>, acc}
+
+  defp parse_lines(bin, acc) do
+    case parse_station(bin, bin, 0) do
+      {:ok, key, temp, rest} ->
+        parse_lines(rest, update(acc, key, temp))
+
+      :incomplete ->
+        {bin, acc}
+
+      :error ->
+        # Skip malformed line and keep parsing next lines.
+        parse_lines(drop_to_next_line(bin), acc)
+    end
+  end
+
+  defp parse_station(orig, <<";", temp_bin::binary>>, key_size) do
+    <<key::binary-size(key_size), ?;, _::binary>> = orig
+
+    case parse_temp_with_nl(temp_bin) do
+      {:ok, temp, rest} -> {:ok, key, temp, rest}
+      :incomplete -> :incomplete
+      :error -> :error
+    end
+  end
+
+  defp parse_station(_orig, <<>>, _key_size), do: :incomplete
+  defp parse_station(_orig, <<?\n, _rest::binary>>, _key_size), do: :error
+  defp parse_station(orig, <<_c, rest::binary>>, key_size), do: parse_station(orig, rest, key_size + 1)
+
+  defp parse_temp_with_nl(<<?-, d1, ?., d2, ?\n, rest::binary>>),
+    do: {:ok, -(digit(d1) * 10 + digit(d2)), rest}
+
+  defp parse_temp_with_nl(<<d1, ?., d2, ?\n, rest::binary>>),
+    do: {:ok, digit(d1) * 10 + digit(d2), rest}
+
+  defp parse_temp_with_nl(<<?-, d1, d2, ?., d3, ?\n, rest::binary>>),
+    do: {:ok, -(digit(d1) * 100 + digit(d2) * 10 + digit(d3)), rest}
+
+  defp parse_temp_with_nl(<<d1, d2, ?., d3, ?\n, rest::binary>>),
+    do: {:ok, digit(d1) * 100 + digit(d2) * 10 + digit(d3), rest}
+
+  defp parse_temp_with_nl(<<>>), do: :incomplete
+  defp parse_temp_with_nl(temp_bin) do
+    case :binary.match(temp_bin, "\n") do
+      :nomatch -> :incomplete
+      _ -> :error
+    end
+  end
+
+  defp parse_line_no_nl(bin) do
+    case :binary.match(bin, ";") do
+      {idx, 1} ->
+        key = :binary.part(bin, 0, idx)
+        temp_bin = :binary.part(bin, idx + 1, byte_size(bin) - idx - 1)
+
+        case parse_temp_no_nl(temp_bin) do
+          {:ok, temp} when key != "" -> {:ok, key, temp}
+          _ -> :error
+        end
+
+      :nomatch ->
+        :error
+    end
+  end
+
+  defp parse_temp_no_nl(<<?-, d1, ?., d2>>), do: {:ok, -(digit(d1) * 10 + digit(d2))}
+  defp parse_temp_no_nl(<<d1, ?., d2>>), do: {:ok, digit(d1) * 10 + digit(d2)}
+  defp parse_temp_no_nl(<<?-, d1, d2, ?., d3>>), do: {:ok, -(digit(d1) * 100 + digit(d2) * 10 + digit(d3))}
+  defp parse_temp_no_nl(<<d1, d2, ?., d3>>), do: {:ok, digit(d1) * 100 + digit(d2) * 10 + digit(d3)}
+  defp parse_temp_no_nl(_), do: :error
+
+  defp drop_to_next_line(bin) do
+    case :binary.match(bin, "\n") do
+      {idx, 1} ->
+        skip = idx + 1
+        :binary.part(bin, skip, byte_size(bin) - skip)
+
+      :nomatch ->
+        <<>>
+    end
+  end
+
+  defp update(acc, key, temp) do
+    Map.update(acc, key, {temp, temp, 1, temp}, fn {min, max, count, sum} ->
+      {min(min, temp), max(max, temp), count + 1, sum + temp}
+    end)
+  end
+
+  defp digit(c), do: c - ?0
+end
+
 defmodule ParallelSolver do
   def solve(path, chunk_size, workers) do
     size = File.stat!(path).size
@@ -145,7 +249,7 @@ defmodule ParallelSolver do
   end
 
   defp reduce_range(_fd, pos, stop_pos, _chunk_size, leftover, acc) when pos >= stop_pos do
-    maybe_add_line(leftover, acc)
+    FastParser.flush_tail(leftover, acc)
   end
 
   defp reduce_range(fd, pos, stop_pos, chunk_size, leftover, acc) do
@@ -154,34 +258,12 @@ defmodule ParallelSolver do
     case :file.pread(fd, pos, len) do
       {:ok, data} ->
         combined = leftover <> data
-        lines = :binary.split(combined, "\n", [:global])
-        {complete, [rest]} = Enum.split(lines, -1)
-
-        acc2 =
-          Enum.reduce(complete, acc, fn line, map ->
-            maybe_add_line(line, map)
-          end)
+        {rest, acc2} = FastParser.parse_chunk(combined, acc)
 
         reduce_range(fd, pos + byte_size(data), stop_pos, chunk_size, rest, acc2)
 
       :eof ->
-        maybe_add_line(leftover, acc)
-    end
-  end
-
-  defp maybe_add_line("", acc), do: acc
-
-  defp maybe_add_line(line, acc) do
-    case :binary.split(line, ";") do
-      [city, temp_bin] when city != "" and temp_bin != "" ->
-        temp = Parse.temp(temp_bin)
-
-        Map.update(acc, city, {temp, temp, 1, temp}, fn {min, max, count, sum} ->
-          {min(min, temp), max(max, temp), count + 1, sum + temp}
-        end)
-
-      _ ->
-        acc
+        FastParser.flush_tail(leftover, acc)
     end
   end
 end
