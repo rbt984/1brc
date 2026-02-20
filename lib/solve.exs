@@ -15,6 +15,26 @@ defmodule Parse do
   defp parse_digits(<<d, rest::binary>>, acc), do: parse_digits(rest, acc * 10 + (d - ?0))
 end
 
+defmodule Format do
+  # Round numerator / denominator to nearest integer, ties away from zero.
+  def round_div(numerator, denominator) when numerator >= 0 do
+    div(numerator * 2 + denominator, denominator * 2)
+  end
+
+  def round_div(numerator, denominator) do
+    -div(abs(numerator) * 2 + denominator, denominator * 2)
+  end
+
+  # Format a value stored in tenths as "x.y" without floats.
+  def tenths(value) do
+    sign = if value < 0, do: "-", else: ""
+    abs_value = abs(value)
+    whole = div(abs_value, 10)
+    frac = rem(abs_value, 10)
+    "#{sign}#{whole}.#{frac}"
+  end
+end
+
 # Read file in binary chunks, handle line boundaries
 defmodule Chunker do
   def stream(path, chunk_size) do
@@ -49,12 +69,17 @@ result =
   |> Task.async_stream(
     fn lines ->
       Enum.reduce(lines, %{}, fn line, acc ->
-        [city, temp_bin] = :binary.split(line, ";")
-        temp = Parse.temp(temp_bin)
+        case :binary.split(line, ";") do
+          [city, temp_bin] when city != "" and temp_bin != "" ->
+            temp = Parse.temp(temp_bin)
 
-        Map.update(acc, city, {temp, temp, 1, temp}, fn {min, max, count, sum} ->
-          {min(min, temp), max(max, temp), count + 1, sum + temp}
-        end)
+            Map.update(acc, city, {temp, temp, 1, temp}, fn {min, max, count, sum} ->
+              {min(min, temp), max(max, temp), count + 1, sum + temp}
+            end)
+
+          _ ->
+            acc
+        end
       end)
     end,
     max_concurrency: System.schedulers_online(),
@@ -72,8 +97,8 @@ output =
   result
   |> Enum.sort_by(fn {city, _} -> city end)
   |> Enum.map(fn {city, {min, max, count, sum}} ->
-    mean = sum / count / 10
-    "#{city}=#{Float.round(min / 10, 1)}/#{Float.round(mean, 1)}/#{Float.round(max / 10, 1)}"
+    mean = Format.round_div(sum, count)
+    "#{city}=#{Format.tenths(min)}/#{Format.tenths(mean)}/#{Format.tenths(max)}"
   end)
   |> Enum.join(", ")
 
