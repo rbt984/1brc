@@ -442,7 +442,7 @@ defmodule Onebtc.CreateMeasurements do
     File.mkdir_p!("./data")
     file = File.open!(measurement_file(count), [:write, :utf8])
 
-    {gen_us, chunks} = :timer.tc(fn ->
+    {total_us, :ok} = :timer.tc(fn ->
       1..count
       |> Stream.map(fn _ ->
         {city, avg} = Enum.random(cities)
@@ -450,20 +450,15 @@ defmodule Onebtc.CreateMeasurements do
         "#{city};#{Float.round(temp, 1)}\n"
       end)
       |> Stream.chunk_every(10_000)
-      |> Enum.to_list()
-    end)
-
-    {write_us, :ok} = :timer.tc(fn ->
-      Enum.each(chunks, &IO.write(file, &1))
+      |> Enum.each(&IO.write(file, &1))
     end)
 
     File.close(file)
 
     elapsed = System.monotonic_time(:millisecond) - start
     IO.puts("---")
-    IO.puts("Generate:  #{div(gen_us, 1000)}ms")
-    IO.puts("Write:     #{div(write_us, 1000)}ms")
-    IO.puts("Total:     #{elapsed}ms")
+    IO.puts("Generate + Write: #{div(total_us, 1000)}ms")
+    IO.puts("Total:            #{elapsed}ms")
     IO.puts("File: #{measurement_file(count)}")
   end
 end
