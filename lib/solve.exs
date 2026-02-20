@@ -59,30 +59,42 @@ defmodule Format do
 end
 
 defmodule FastParser do
-  def parse_chunk(bin, acc), do: parse_lines(bin, acc)
+  def parse_chunk(bin), do: parse_lines(bin)
 
-  def flush_tail(<<>>, acc), do: acc
+  def flush_tail(<<>>), do: :ok
 
-  def flush_tail(bin, acc) do
+  def flush_tail(bin) do
     case parse_line_no_nl(bin) do
-      {:ok, key, temp} -> update(acc, key, temp)
-      :error -> acc
+      {:ok, key, temp} -> update(key, temp)
+      :error -> :ok
     end
   end
 
-  defp parse_lines(<<>>, acc), do: {<<>>, acc}
+  def to_map do
+    :erlang.get()
+    |> Enum.reduce(%{}, fn
+      {key, {min, max, count, sum}}, acc when is_binary(key) ->
+        Map.put(acc, key, {min, max, count, sum})
 
-  defp parse_lines(bin, acc) do
+      _, acc ->
+        acc
+    end)
+  end
+
+  defp parse_lines(<<>>), do: <<>>
+
+  defp parse_lines(bin) do
     case parse_station(bin, bin, 0) do
       {:ok, key, temp, rest} ->
-        parse_lines(rest, update(acc, key, temp))
+        update(key, temp)
+        parse_lines(rest)
 
       :incomplete ->
-        {bin, acc}
+        bin
 
       :error ->
         # Skip malformed line and keep parsing next lines.
-        parse_lines(drop_to_next_line(bin), acc)
+        parse_lines(drop_to_next_line(bin))
     end
   end
 
@@ -153,13 +165,13 @@ defmodule FastParser do
     end
   end
 
-  defp update(acc, key, temp) do
-    case acc do
-      %{^key => {min, max, count, sum}} ->
-        %{acc | key => {min(min, temp), max(max, temp), count + 1, sum + temp}}
+  defp update(key, temp) do
+    case :erlang.get(key) do
+      :undefined ->
+        :erlang.put(:binary.copy(key), {temp, temp, 1, temp})
 
-      _ ->
-        Map.put(acc, :binary.copy(key), {temp, temp, 1, temp})
+      {min, max, count, sum} ->
+        :erlang.put(key, {min(min, temp), max(max, temp), count + 1, sum + temp})
     end
   end
 
@@ -246,28 +258,30 @@ defmodule ParallelSolver do
     {:ok, fd} = :file.open(path, [:read, :raw, :binary])
 
     try do
-      reduce_range(fd, start_pos, stop_pos, chunk_size, "", %{})
+      reduce_range(fd, start_pos, stop_pos, chunk_size, "")
     after
       :file.close(fd)
     end
   end
 
-  defp reduce_range(_fd, pos, stop_pos, _chunk_size, leftover, acc) when pos >= stop_pos do
-    FastParser.flush_tail(leftover, acc)
+  defp reduce_range(_fd, pos, stop_pos, _chunk_size, leftover) when pos >= stop_pos do
+    FastParser.flush_tail(leftover)
+    FastParser.to_map()
   end
 
-  defp reduce_range(fd, pos, stop_pos, chunk_size, leftover, acc) do
+  defp reduce_range(fd, pos, stop_pos, chunk_size, leftover) do
     len = min(chunk_size, stop_pos - pos)
 
     case :file.pread(fd, pos, len) do
       {:ok, data} ->
         combined = leftover <> data
-        {rest, acc2} = FastParser.parse_chunk(combined, acc)
+        rest = FastParser.parse_chunk(combined)
 
-        reduce_range(fd, pos + byte_size(data), stop_pos, chunk_size, rest, acc2)
+        reduce_range(fd, pos + byte_size(data), stop_pos, chunk_size, rest)
 
       :eof ->
-        FastParser.flush_tail(leftover, acc)
+        FastParser.flush_tail(leftover)
+        FastParser.to_map()
     end
   end
 end
