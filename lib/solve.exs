@@ -27,17 +27,6 @@ defmodule Prof do
   def mb(bytes), do: :erlang.float_to_binary(bytes / 1_048_576, decimals: 2)
 end
 
-# Parse temperature from binary — avoids Float.parse overhead
-# Input: "15.4" or "-2.3" — always exactly 1 decimal place
-# Returns integer × 10 (e.g., "15.4" → 154, "-2.3" → -23)
-defmodule Parse do
-  def temp(<<?-, rest::binary>>), do: -parse_digits(rest, 0)
-  def temp(bin), do: parse_digits(bin, 0)
-
-  defp parse_digits(<<?., d, _rest::binary>>, acc), do: acc * 10 + (d - ?0)
-  defp parse_digits(<<d, rest::binary>>, acc), do: parse_digits(rest, acc * 10 + (d - ?0))
-end
-
 defmodule Format do
   # Round numerator / denominator to nearest integer, ties away from zero.
   def round_div(numerator, denominator) when numerator >= 0 do
@@ -58,111 +47,69 @@ defmodule Format do
   end
 end
 
-defmodule FastParser do
-  def parse_chunk(bin), do: parse_lines(bin)
+defmodule Worker do
+  def run(parent_pid) do
+    send(parent_pid, {:give_work, self()})
 
-  def flush_tail(<<>>), do: :ok
+    receive do
+      {:do_work, chunk} ->
+        parse_lines(chunk)
+        run(parent_pid)
 
-  def flush_tail(bin) do
-    case parse_line_no_nl(bin) do
-      {:ok, key, temp} -> update(key, temp)
-      :error -> :ok
+      :result ->
+        result =
+          :erlang.get()
+          |> Enum.reduce(%{}, fn
+            {key, {min, max, count, sum}}, acc when is_binary(key) ->
+              Map.put(acc, key, {min, max, count, sum})
+
+            _, acc ->
+              acc
+          end)
+
+        send(parent_pid, {:result, self(), result})
     end
   end
 
-  def to_map do
-    :erlang.get()
-    |> Enum.reduce(%{}, fn
-      {key, {min, max, count, sum}}, acc when is_binary(key) ->
-        Map.put(acc, key, {min, max, count, sum})
-
-      _, acc ->
-        acc
-    end)
-  end
-
-  defp parse_lines(<<>>), do: <<>>
+  defp parse_lines(<<>>), do: :ok
 
   defp parse_lines(bin) do
-    case parse_station(bin, bin, 0) do
-      {:ok, key, temp, rest} ->
-        update(key, temp)
-        parse_lines(rest)
-
-      :incomplete ->
-        bin
-
-      :error ->
-        # Skip malformed line and keep parsing next lines.
-        parse_lines(drop_to_next_line(bin))
-    end
+    parse_station(bin, bin, 0)
   end
 
   defp parse_station(orig, <<";", temp_bin::binary>>, key_size) do
-    <<key::binary-size(key_size), ?;, _::binary>> = orig
-
-    case parse_temp_with_nl(temp_bin) do
-      {:ok, temp, rest} -> {:ok, key, temp, rest}
-      :incomplete -> :incomplete
-      :error -> :error
-    end
+    <<key::binary-size(key_size), ";", _::binary>> = orig
+    parse_temp(temp_bin, key)
   end
 
-  defp parse_station(_orig, <<>>, _key_size), do: :incomplete
-  defp parse_station(_orig, <<?\n, _rest::binary>>, _key_size), do: :error
-  defp parse_station(orig, <<_c, rest::binary>>, key_size), do: parse_station(orig, rest, key_size + 1)
+  defp parse_station(_orig, <<>>, _key_size), do: :ok
 
-  defp parse_temp_with_nl(<<?-, d1, ?., d2, ?\n, rest::binary>>),
-    do: {:ok, -(digit(d1) * 10 + digit(d2)), rest}
-
-  defp parse_temp_with_nl(<<d1, ?., d2, ?\n, rest::binary>>),
-    do: {:ok, digit(d1) * 10 + digit(d2), rest}
-
-  defp parse_temp_with_nl(<<?-, d1, d2, ?., d3, ?\n, rest::binary>>),
-    do: {:ok, -(digit(d1) * 100 + digit(d2) * 10 + digit(d3)), rest}
-
-  defp parse_temp_with_nl(<<d1, d2, ?., d3, ?\n, rest::binary>>),
-    do: {:ok, digit(d1) * 100 + digit(d2) * 10 + digit(d3), rest}
-
-  defp parse_temp_with_nl(<<>>), do: :incomplete
-  defp parse_temp_with_nl(temp_bin) do
-    case :binary.match(temp_bin, "\n") do
-      :nomatch -> :incomplete
-      _ -> :error
-    end
+  defp parse_station(orig, <<_c, rest::binary>>, key_size) do
+    parse_station(orig, rest, key_size + 1)
   end
 
-  defp parse_line_no_nl(bin) do
-    case :binary.match(bin, ";") do
-      {idx, 1} ->
-        key = :binary.part(bin, 0, idx)
-        temp_bin = :binary.part(bin, idx + 1, byte_size(bin) - idx - 1)
-
-        case parse_temp_no_nl(temp_bin) do
-          {:ok, temp} when key != "" -> {:ok, key, temp}
-          _ -> :error
-        end
-
-      :nomatch ->
-        :error
-    end
+  # -D.D\n
+  defp parse_temp(<<?-, d1, ?., d2, ?\n, rest::binary>>, key) do
+    update(key, -(digit(d1) * 10 + digit(d2)))
+    parse_lines(rest)
   end
 
-  defp parse_temp_no_nl(<<?-, d1, ?., d2>>), do: {:ok, -(digit(d1) * 10 + digit(d2))}
-  defp parse_temp_no_nl(<<d1, ?., d2>>), do: {:ok, digit(d1) * 10 + digit(d2)}
-  defp parse_temp_no_nl(<<?-, d1, d2, ?., d3>>), do: {:ok, -(digit(d1) * 100 + digit(d2) * 10 + digit(d3))}
-  defp parse_temp_no_nl(<<d1, d2, ?., d3>>), do: {:ok, digit(d1) * 100 + digit(d2) * 10 + digit(d3)}
-  defp parse_temp_no_nl(_), do: :error
+  # D.D\n
+  defp parse_temp(<<d1, ?., d2, ?\n, rest::binary>>, key) do
+    update(key, digit(d1) * 10 + digit(d2))
+    parse_lines(rest)
+  end
 
-  defp drop_to_next_line(bin) do
-    case :binary.match(bin, "\n") do
-      {idx, 1} ->
-        skip = idx + 1
-        :binary.part(bin, skip, byte_size(bin) - skip)
+  # -DD.D\n
+  defp parse_temp(<<?-, d1, d2, ?., d3, ?\n, rest::binary>>, key) do
+    update(key, -(digit(d1) * 100 + digit(d2) * 10 + digit(d3)))
+    parse_lines(rest)
+  end
 
-      :nomatch ->
-        <<>>
-    end
+  # DD.D\n
+  defp parse_temp(<<d1, d2, ?., d3, ?\n, rest::binary>>, key) do
+    update(key, digit(d1) * 100 + digit(d2) * 10 + digit(d3))
+    parse_lines(rest)
   end
 
   defp update(key, temp) do
@@ -178,119 +125,61 @@ defmodule FastParser do
   defp digit(c), do: c - ?0
 end
 
-defmodule ParallelSolver do
-  def solve(path, chunk_size, workers) do
-    size = File.stat!(path).size
+defmodule Solver do
+  def solve(path, chunk_size, worker_count) do
+    parent = self()
 
-    ranges =
-      partition_ranges(path, size, workers)
-      |> Enum.filter(fn {start_pos, stop_pos} -> start_pos < stop_pos end)
+    wpids =
+      for _ <- 1..worker_count do
+        spawn_link(fn -> Worker.run(parent) end)
+      end
 
-    ranges
-    |> Task.async_stream(
-      fn {start_pos, stop_pos} -> solve_range(path, start_pos, stop_pos, chunk_size) end,
-      max_concurrency: workers,
-      ordered: false,
-      timeout: :infinity
-    )
-    |> Enum.reduce(%{}, fn {:ok, chunk_map}, acc ->
-      Map.merge(acc, chunk_map, fn _city, {min1, max1, c1, s1}, {min2, max2, c2, s2} ->
-        {min(min1, min2), max(max1, max2), c1 + c2, s1 + s2}
-      end)
+    {:ok, fd} = :prim_file.open(path, [:raw, :binary, :read])
+    :ok = dispatch_chunks(fd, chunk_size)
+    :prim_file.close(fd)
+
+    # Collect results from all workers
+    wpids
+    |> Enum.reduce(%{}, fn wpid, acc ->
+      send(wpid, :result)
+
+      receive do
+        {:result, ^wpid, result} ->
+          Map.merge(acc, result, fn _city, {min1, max1, c1, s1}, {min2, max2, c2, s2} ->
+            {min(min1, min2), max(max1, max2), c1 + c2, s1 + s2}
+          end)
+      end
     end)
   end
 
-  defp partition_ranges(_path, 0, _workers), do: []
+  defp dispatch_chunks(fd, chunk_size) do
+    case :prim_file.read(fd, chunk_size) do
+      :eof ->
+        :ok
 
-  defp partition_ranges(path, size, workers) do
-    step = div(size + workers - 1, workers)
-
-    {:ok, fd} = :file.open(path, [:read, :raw, :binary])
-
-    boundaries =
-      try do
-        mids =
-          if workers > 1 do
-            for i <- 1..(workers - 1) do
-              raw = min(i * step, size)
-              find_next_line_start(fd, raw, size)
-            end
-          else
-            []
+      {:ok, data} ->
+        # Read one more line to complete partial line at chunk boundary
+        data =
+          case :prim_file.read_line(fd) do
+            {:ok, line} -> <<data::binary, line::binary>>
+            :eof -> data
           end
 
-        [0 | mids] ++ [size]
-      after
-        :file.close(fd)
-      end
-      |> Enum.uniq()
-      |> Enum.sort()
-
-    boundaries
-    |> Enum.chunk_every(2, 1, :discard)
-    |> Enum.map(fn [start_pos, stop_pos] -> {start_pos, stop_pos} end)
-  end
-
-  defp find_next_line_start(_fd, pos, size) when pos >= size, do: size
-
-  defp find_next_line_start(fd, pos, size) do
-    scan(fd, pos, size)
-  end
-
-  defp scan(_fd, pos, size) when pos >= size, do: size
-
-  defp scan(fd, pos, size) do
-    len = min(65_536, size - pos)
-
-    case :file.pread(fd, pos, len) do
-      {:ok, data} ->
-        case :binary.match(data, "\n") do
-          {idx, 1} -> pos + idx + 1
-          :nomatch -> scan(fd, pos + len, size)
+        receive do
+          {:give_work, wpid} ->
+            send(wpid, {:do_work, data})
         end
 
-      :eof ->
-        size
-    end
-  end
-
-  defp solve_range(path, start_pos, stop_pos, chunk_size) do
-    {:ok, fd} = :file.open(path, [:read, :raw, :binary])
-
-    try do
-      reduce_range(fd, start_pos, stop_pos, chunk_size, "")
-    after
-      :file.close(fd)
-    end
-  end
-
-  defp reduce_range(_fd, pos, stop_pos, _chunk_size, leftover) when pos >= stop_pos do
-    FastParser.flush_tail(leftover)
-    FastParser.to_map()
-  end
-
-  defp reduce_range(fd, pos, stop_pos, chunk_size, leftover) do
-    len = min(chunk_size, stop_pos - pos)
-
-    case :file.pread(fd, pos, len) do
-      {:ok, data} ->
-        combined = leftover <> data
-        rest = FastParser.parse_chunk(combined)
-
-        reduce_range(fd, pos + byte_size(data), stop_pos, chunk_size, rest)
-
-      :eof ->
-        FastParser.flush_tail(leftover)
-        FastParser.to_map()
+        dispatch_chunks(fd, chunk_size)
     end
   end
 end
 
-# Process chunks in parallel, each returns a local map, merge at end
+# Process chunks in parallel
 profile_before = if profile?, do: Prof.snapshot(), else: nil
 compute_started_at = Prof.now()
 
-result = ParallelSolver.solve(file, chunk_size, workers)
+result = Solver.solve(file, chunk_size, workers)
 
 # Format output
 compute_finished_at = Prof.now()
