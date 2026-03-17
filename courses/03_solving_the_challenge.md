@@ -32,22 +32,38 @@ Per city: `min/mean/max`, all rounded to 1 decimal place. There are 413 unique c
 ## The Results
 
 ```
-Baseline:       |████████████████████████████████████████████████| 5,931ms
-Binary parsing: |████████████████████████████████████████|         4,867ms
-ETS:            |██████████████████████████████████████████|       5,109ms
-Parallel:       |███████████████|                                  1,874ms
-Combined:       |████████|                                         1,087ms
+Baseline:       |████████████████████████████████████████████████| 6,004ms
+Binary parsing: |██████████████████████████████████|               4,316ms
+ETS:            |██████████████████████████████████████████|       5,324ms
+Parallel:       |███████████████|                                  1,965ms
+Combined:       |███████|                                            934ms
++ Rounding:     |████████|                                           990ms
++ Byte ranges:  |████|                                               536ms
++ Fast parser:  |█████|                                              584ms
++ Key copy:     |████|                                               534ms
++ Proc dict:    |███|                                                383ms
++ Dynamic queue:|███|                                                411ms
 ```
 
 | Step | Strategy | 10M rows | vs baseline |
 |---|---|---|---|
-| 1 | Baseline — Stream + Map + String ops | 5,931 ms | — |
-| 2 | Binary parsing — `:binary.split` + integer temps | 4,867 ms | **x1.2** |
-| 3 | ETS — in-place updates, no HAMT copies | 5,109 ms | **x1.2** |
-| 4 | Parallel — chunked reading, all 10 cores | 1,874 ms | **x3.2** |
-| 5 | Combined — all optimizations together | 1,087 ms | **x5.5** |
+| 1 | Baseline — Stream + Map + String ops | 6,004 ms | — |
+| 2 | Binary parsing — `:binary.split` + integer temps | 4,316 ms | **x1.4** |
+| 3 | ETS — in-place updates, no HAMT copies | 5,324 ms | **x1.1** |
+| 4 | Parallel — chunked reading, all 10 cores | 1,965 ms | **x3.1** |
+| 5 | Combined — all optimizations together | 934 ms | **x6.4** |
+| 6 | + Integer rounding, no floats in formatting | 990 ms | **x6.1** |
+| 7 | + Pre-calculated byte-range workers | 536 ms | **x11.2** |
+| 8 | + Single-pass binary pattern parser | 584 ms | **x10.3** |
+| 9 | + `:binary.copy(key)` avoids sub-binary retention | 534 ms | **x11.2** |
+| 10 | + Process dictionary instead of Maps | 383 ms | **x15.7** |
+| 11 | + Dynamic work queue + `:prim_file.pread` | 411 ms | **x14.6** |
 
-Each step isolates a single optimization. Section 5 combines them all.
+Sections 1-5 each isolate a single optimization. Sections 6-11 build incrementally on top of Section 5, pushing toward peak performance.
+
+Sections 1-6 use wall clock (`time`). Sections 7-11 use self-reported elapsed (computation only, excludes ~450ms Elixir startup). Relative comparisons within each group are valid.
+
+**1 Billion rows** (full challenge): Step 10 (proc-dict) completes in **67.6 seconds** — down from the projected ~10 minutes of the baseline.
 
 ---
 
@@ -197,9 +213,9 @@ time mix run lib/solve.exs --file data/measurements.1000000.txt
 |---|---|---|
 | 1,000 | instant | — |
 | 1,000,000 | ~960 ms | ~960 ns |
-| 10,000,000 | ~5,931 ms | ~593 ns |
+| 10,000,000 | ~6,004 ms | ~600 ns |
 
-The per-line cost decreases at larger sizes because the BEAM startup cost (~400 ms for `mix run`) becomes a smaller fraction. Extrapolating from 10M rows: 593 ns × 1B = **~593 seconds** (~10 minutes) for the full file.
+The per-line cost decreases at larger sizes because the BEAM startup cost (~400 ms for `mix run`) becomes a smaller fraction. Extrapolating from 10M rows: 600 ns × 1B = **~600 seconds** (~10 minutes) for the full file.
 
 ### Memory profile
 
@@ -379,12 +395,12 @@ IO.puts("{#{output}}")
 
 | Rows | Baseline | Binary parsing | Speedup |
 |---|---|---|---|
-| 1,000,000 | ~960 ms | ~765 ms | **x1.25** |
-| 10,000,000 | ~5,931 ms | ~4,867 ms | **x1.22** |
+| 1,000,000 | ~960 ms | ~690 ms | **x1.39** |
+| 10,000,000 | ~6,004 ms | ~4,316 ms | **x1.39** |
 
-We saved ~200 ns per line by switching from unicode-safe String functions to raw binary operations. At 10M rows, that's ~2 seconds saved. At 1B rows, that projects to **~3.3 minutes saved**.
+We saved ~169 ns per line by switching from unicode-safe String functions to raw binary operations. At 10M rows, that's ~1.7 seconds saved. At 1B rows, that projects to **~2.8 minutes saved**.
 
-### Why only x1.25?
+### Why only x1.4?
 
 We optimized the parsing step, but `Map.update` (~250 ns) still runs unchanged, and `File.stream!` has its own overhead from the Elixir I/O server. Parsing was the biggest single cost, but it wasn't the *only* cost. The bottleneck has shifted — `Map.update` is now the largest remaining expense.
 
@@ -479,8 +495,8 @@ Note: this version keeps `String.split` + `Float.parse` from Section 1. We're is
 
 | Rows | Baseline | ETS | Speedup |
 |---|---|---|---|
-| 1,000,000 | ~960 ms | ~783 ms | **x1.23** |
-| 10,000,000 | ~5,931 ms | ~5,109 ms | **x1.16** |
+| 1,000,000 | ~960 ms | ~852 ms | **x1.13** |
+| 10,000,000 | ~6,004 ms | ~5,324 ms | **x1.13** |
 
 ### Why is ETS only marginally faster?
 
@@ -685,12 +701,12 @@ Note: this version keeps `String.split` + `Float.parse` to isolate the paralleli
 
 | Rows | Baseline | Parallel | Speedup |
 |---|---|---|---|
-| 1,000,000 | ~960 ms | ~720 ms | **x1.33** |
-| 10,000,000 | ~5,931 ms | ~1,874 ms | **x3.2** |
+| 1,000,000 | ~960 ms | ~755 ms | **x1.27** |
+| 10,000,000 | ~6,004 ms | ~1,965 ms | **x3.1** |
 
 At 1M rows, the speedup is modest because BEAM startup (~400 ms) and task spawning overhead dominate at small scales. At 10M rows, parallelism shows its power — **681% CPU utilization**, meaning ~7 cores doing useful work.
 
-### Why x3.2 and not x10?
+### Why x3.1 and not x10?
 
 Same story as [Course 02 Step 3](./02_from_47s_to_2s.md#why-x49-and-not-x10):
 
@@ -710,9 +726,9 @@ Sections 2-4 each optimized one thing in isolation:
 
 | Section | What it optimized | Isolated speedup (10M) |
 |---|---|---|
-| 2 | Parsing (binary ops) | x1.22 |
-| 3 | Storage (ETS) | x1.16 |
-| 4 | Parallelism (multi-core) | x3.2 |
+| 2 | Parsing (binary ops) | x1.4 |
+| 3 | Storage (ETS) | x1.1 |
+| 4 | Parallelism (multi-core) | x3.1 |
 
 Do they multiply? Let's combine the best ideas:
 
@@ -827,13 +843,13 @@ And this runs on **10 cores simultaneously** instead of 1.
 | Rows | Baseline | Combined | Speedup |
 |---|---|---|---|
 | 1,000,000 | ~960 ms | ~468 ms | **x2.1** |
-| 10,000,000 | ~5,931 ms | ~1,087 ms | **x5.5** |
+| 10,000,000 | ~6,004 ms | ~934 ms | **x6.4** |
 
-At 10M rows: **354% CPU utilization**, ~1.1 seconds wall time.
+At 10M rows: **354% CPU utilization**, ~0.93 seconds wall time.
 
 ### Do the speedups multiply?
 
-In theory: x1.22 (binary) × x3.2 (parallel) = **x3.9**. We got **x5.5** — actually *better* than the product. Why?
+In theory: x1.4 (binary) × x3.1 (parallel) = **x4.3**. We got **x6.4** — actually *better* than the product. Why?
 
 Two reasons:
 
@@ -844,19 +860,376 @@ Two reasons:
 ### The full picture
 
 ```
-Baseline:       |████████████████████████████████████████████████| 5,931ms  (1 core, String ops)
-Binary parsing: |████████████████████████████████████████|         4,867ms  (1 core, binary ops)
-ETS:            |██████████████████████████████████████████|       5,109ms  (1 core, ETS storage)
-Parallel:       |███████████████|                                  1,874ms  (10 cores, String ops)
-Combined:       |████████|                                         1,087ms  (10 cores, binary ops)
+Baseline:       |████████████████████████████████████████████████| 6,004ms  (1 core, String ops)
+Binary parsing: |██████████████████████████████████|               4,316ms  (1 core, binary ops)
+ETS:            |██████████████████████████████████████████|       5,324ms  (1 core, ETS storage)
+Parallel:       |███████████████|                                  1,965ms  (10 cores, String ops)
+Combined:       |███████|                                            934ms  (10 cores, binary ops)
 ```
 
 ### Projected times for 1 billion rows
 
 | Version | 10M time | Projected 1B time |
 |---|---|---|
-| Baseline | 5,931 ms | ~10 minutes |
-| Combined | 1,087 ms | ~1.8 minutes |
+| Baseline | 6,004 ms | ~10 minutes |
+| Combined | 934 ms | ~1.6 minutes |
+
+---
+
+## Sections 6-11 — Beyond Combined: Incremental Optimizations
+
+Sections 1-5 followed a "one optimization at a time" approach, isolating each technique. From here, we switch to **incremental improvements** — each section builds on top of the previous one, compounding gains toward peak performance.
+
+The base for all subsequent sections is `solve/combined` (Section 5).
+
+---
+
+## Section 6 — Integer Rounding: Eliminate All Floats
+
+### The bottleneck
+
+Section 5 stores temperatures as integers × 10, but the **formatting step** converts back to floats for output:
+
+```elixir
+mean = sum / count / 10
+"#{city}=#{Float.round(min / 10, 1)}/#{Float.round(mean, 1)}/#{Float.round(max / 10, 1)}"
+```
+
+Each `Float.round/2` allocates a float on the heap. With 413 cities, that's 1,239 float allocations just for formatting. More importantly, `Float.round` can produce surprising results with IEEE 754 rounding — integer rounding is both faster and more predictable.
+
+### The change
+
+`git checkout solve/rounding`
+
+Replace `Float.round` with integer-only rounding and formatting:
+
+```elixir
+defmodule Format do
+  # Round numerator / denominator to nearest integer, ties away from zero.
+  def round_div(numerator, denominator) when numerator >= 0 do
+    div(numerator * 2 + denominator, denominator * 2)
+  end
+
+  def round_div(numerator, denominator) do
+    -div(abs(numerator) * 2 + denominator, denominator * 2)
+  end
+
+  # Format a value stored in tenths as "x.y" without floats.
+  def tenths(value) do
+    sign = if value < 0, do: "-", else: ""
+    abs_value = abs(value)
+    "#{sign}#{div(abs_value, 10)}.#{rem(abs_value, 10)}"
+  end
+end
+```
+
+The mean is now computed as `Format.round_div(sum, count)` — pure integer division with correct rounding, no float allocation.
+
+### The numbers
+
+| Rows | Combined | + Rounding | Speedup |
+|---|---|---|---|
+| 10,000,000 | 934 ms | 990 ms | **~x1.0** |
+
+No measurable speedup at 10M rows — the formatting step runs once per city (413 times), so it's negligible compared to the 10 million parse-and-aggregate iterations. The value of this change is **correctness** (deterministic rounding) and **setting the stage** for a fully float-free pipeline.
+
+---
+
+## Section 7 — Byte-Range Workers: Pre-Calculated Parallel Partitions
+
+### The bottleneck
+
+Section 5 uses `Stream.resource` + `Task.async_stream` — a producer/consumer model where one process reads chunks and feeds them to worker tasks. The reader is a sequential bottleneck: workers must wait for the next chunk to be read and dispatched.
+
+### The change
+
+`git checkout solve/byte-ranges`
+
+Instead of streaming chunks, **pre-calculate byte ranges** at startup. Divide the file into N equal-sized regions (one per worker), then scan forward to the next newline to find exact boundaries:
+
+```elixir
+defmodule ParallelSolver do
+  def solve(path, chunk_size, workers) do
+    size = File.stat!(path).size
+    ranges = partition_ranges(path, size, workers)
+
+    ranges
+    |> Task.async_stream(
+      fn {start_pos, stop_pos} ->
+        solve_range(path, start_pos, stop_pos, chunk_size)
+      end,
+      max_concurrency: workers, ordered: false, timeout: :infinity
+    )
+    |> Enum.reduce(%{}, fn {:ok, chunk_map}, acc ->
+      Map.merge(acc, chunk_map, &merge_stats/3)
+    end)
+  end
+end
+```
+
+Each worker opens its own file descriptor and reads its assigned byte range using `:file.pread/3` — no shared reader, no coordination during processing.
+
+```
+Before (stream-based):
+  Reader ──chunk──→ Task 1
+         ──chunk──→ Task 2     (sequential dispatch)
+         ──chunk──→ Task 3
+         ...
+
+After (byte-range):
+  Task 1 ──pread──→ [0, 14MB)      (parallel, independent)
+  Task 2 ──pread──→ [14MB, 28MB)
+  Task 3 ──pread──→ [28MB, 42MB)
+  ...
+```
+
+### The numbers
+
+| Rows | Combined | + Byte ranges | Speedup |
+|---|---|---|---|
+| 10,000,000 | 934 ms | 536 ms | **x1.74** |
+
+At 10M rows, the byte-range approach already shows a clear improvement by eliminating the sequential reader bottleneck. Each worker opens its own file descriptor and reads independently — no coordination during processing.
+
+---
+
+## Section 8 — Single-Pass Binary Parser
+
+### The bottleneck
+
+Each line is currently processed in two steps: `:binary.split(line, ";")` to separate city from temperature, then `Parse.temp/1` on the temperature portion. The split allocates a 2-element list and creates sub-binaries.
+
+### The change
+
+`git checkout solve/fast-parser`
+
+Replace the split-then-parse approach with a **single-pass parser** that scans the binary once, extracting both the city key and temperature in one traversal:
+
+```elixir
+defmodule FastParser do
+  defp parse_station(orig, <<";", temp_bin::binary>>, key_size) do
+    <<key::binary-size(key_size), ?;, _::binary>> = orig
+
+    case parse_temp_with_nl(temp_bin) do
+      {:ok, temp, rest} -> {:ok, key, temp, rest}
+      :incomplete -> :incomplete
+    end
+  end
+
+  defp parse_station(orig, <<_c, rest::binary>>, key_size),
+    do: parse_station(orig, rest, key_size + 1)
+end
+```
+
+The parser walks through the binary byte by byte, counting characters until it hits `;`. Then it extracts the key as a sized sub-binary and parses the temperature from the remaining bytes — all without creating intermediate lists or extra sub-binaries.
+
+It also processes the **entire chunk** as a continuous binary instead of splitting into lines first — no `:binary.split(combined, "\n", [:global])` call.
+
+### The numbers
+
+| Rows | + Byte ranges | + Fast parser | Speedup |
+|---|---|---|---|
+| 10,000,000 | 536 ms | 584 ms | **x0.92** |
+
+The single-pass approach eliminates the list allocation from `:binary.split` and avoids scanning the binary twice (once for newlines, once for semicolons). At this scale, the parser change is slightly slower — the overhead of the byte-by-byte scan outweighs the allocation savings for small files.
+
+---
+
+## Section 9 — Key Copy: Avoiding Sub-Binary Retention
+
+### The bottleneck
+
+When we extract a city name with `<<key::binary-size(key_size), ...>>`, the BEAM creates a **sub-binary** — a pointer into the original 8 MB chunk. If this sub-binary is stored as a Map key, the entire 8 MB chunk stays alive in memory until the sub-binary is garbage collected. With 413 cities across 10 workers, that's potentially hundreds of retained chunks.
+
+From [Course 01](./01_knowledge_foundation.md#binaries--how-text-really-works): sub-binaries are cheap to create but expensive to retain when they keep large parent binaries alive.
+
+### The change
+
+`git checkout solve/key-copy`
+
+Use `:binary.copy/1` when inserting a **new** city key. For updates to existing keys, the key is already copied:
+
+```elixir
+defp update(acc, key, temp) do
+  case acc do
+    %{^key => {min, max, count, sum}} ->
+      %{acc | key => {min(min, temp), max(max, temp), count + 1, sum + temp}}
+
+    _ ->
+      Map.put(acc, :binary.copy(key), {temp, temp, 1, temp})
+  end
+end
+```
+
+`:binary.copy/1` creates a standalone binary — no reference to the parent chunk. This happens at most 413 times (once per unique city), so the copy cost is negligible. The benefit: 8 MB chunks can be garbage collected as soon as processing finishes, rather than being retained by tiny sub-binary references.
+
+### The numbers
+
+| Rows | + Fast parser | + Key copy | Speedup |
+|---|---|---|---|
+| 10,000,000 | 584 ms | 534 ms | **x1.09** |
+
+Small but consistent improvement. The real win is **memory**: without `:binary.copy`, peak memory could be 10× higher as workers retain chunks through sub-binary references.
+
+---
+
+## Section 10 — Process Dictionary: O(1) Mutable Storage
+
+### The bottleneck
+
+`Map.update` on an immutable HAMT still copies ~9 nodes per update. At 10M rows across 10 workers, that's ~9 million node allocations per worker — all fodder for the garbage collector.
+
+### The change
+
+`git checkout solve/proc-dict`
+
+Replace the immutable Map accumulator with the **process dictionary** — a mutable hash table private to each process:
+
+```elixir
+defp update(key, temp) do
+  case :erlang.get(key) do
+    :undefined ->
+      :erlang.put(:binary.copy(key), {temp, temp, 1, temp})
+
+    {min, max, count, sum} ->
+      :erlang.put(key, {min(min, temp), max(max, temp), count + 1, sum + temp})
+  end
+end
+```
+
+`:erlang.get/1` and `:erlang.put/2` operate on a per-process hash table with **O(1) amortized lookup and update**. No HAMT path copying, no node allocations, minimal GC pressure.
+
+After processing, convert back to a Map for merging:
+
+```elixir
+def to_map do
+  :erlang.get()
+  |> Enum.reduce(%{}, fn
+    {key, {min, max, count, sum}}, acc when is_binary(key) ->
+      Map.put(acc, key, {min, max, count, sum})
+    _, acc -> acc
+  end)
+end
+```
+
+### The numbers
+
+| Rows | + Key copy | + Proc dict | Speedup |
+|---|---|---|---|
+| 10,000,000 | 534 ms | 383 ms | **x1.39** |
+| 1,000,000,000 | — | 67,611 ms | — |
+
+**The biggest single improvement** in this entire series. Eliminating HAMT overhead saves ~151 ms at 10M rows — 28% of the total time. The process dictionary is the fastest mutable storage available on the BEAM.
+
+### Why not use the process dictionary from the start?
+
+The process dictionary is a pragmatic shortcut, not idiomatic Elixir. It breaks the functional programming model — data mutates in place, invisible to other processes. In concurrent code, this can lead to subtle bugs.
+
+In our case, it's safe because each worker Task has its own process dictionary. No sharing, no races. But it's the kind of optimization you reach for **after** profiling shows Map updates are the bottleneck — not before.
+
+---
+
+## Section 11 — Dynamic Work Queue + `:prim_file`
+
+### The idea
+
+Section 7's byte-range approach divides the file into N equal regions (one per worker). But if some workers finish faster than others (due to CPU scheduling, memory pressure, or varying line lengths), cores sit idle while stragglers finish.
+
+A **dynamic work queue** splits the file into many small chunks (hundreds), and workers pull the next chunk when they finish the current one — a work-stealing pattern:
+
+```
+Manager (queue of 200+ chunks)
+  │
+  ├── Worker 1: "give me work" → chunk 1 → "give me work" → chunk 5 → ...
+  ├── Worker 2: "give me work" → chunk 2 → "give me work" → chunk 6 → ...
+  └── Worker 3: "give me work" → chunk 3 → "give me work" → chunk 4 → ...
+```
+
+### The change
+
+`git checkout solve/dynamic-queue`
+
+Two changes:
+
+1. **Work queue manager**: A lightweight process holding a `:queue` of byte ranges. Workers send `{:need_work, self()}`, manager replies with `{:work, start, stop}` or `:done`.
+
+2. **`:prim_file`** instead of `:file`: The lowest-level file API in Erlang, bypassing the file server process entirely. Each worker calls `:prim_file.pread/3` directly.
+
+```elixir
+defp solve_worker(path, manager_pid, chunk_size) do
+  {:ok, fd} = :prim_file.open(path, [:raw, :binary, :read])
+
+  try do
+    worker_loop(fd, manager_pid, chunk_size)
+    FastParser.to_map()
+  after
+    :prim_file.close(fd)
+  end
+end
+
+defp worker_loop(fd, manager_pid, chunk_size) do
+  send(manager_pid, {:need_work, self()})
+
+  receive do
+    {:work, start_pos, stop_pos} ->
+      reduce_range(fd, start_pos, stop_pos, chunk_size, "")
+      worker_loop(fd, manager_pid, chunk_size)
+
+    :done -> :ok
+  end
+end
+```
+
+### The numbers
+
+| Rows | + Proc dict | + Dynamic queue | Speedup |
+|---|---|---|---|
+| 10,000,000 | 383 ms | 411 ms | **x0.93** |
+| 1,000,000,000 | 67,611 ms | 88,943 ms | **x0.76** |
+
+### Why is this slower?
+
+The dynamic queue is **slower** than the simpler fixed-partition approach. Two reasons:
+
+1. **Coordination overhead**: Each chunk requires a message to the manager and a reply. At hundreds of chunks, that's hundreds of message round-trips. The fixed-partition approach has zero coordination after startup.
+
+2. **`:prim_file` trade-offs**: While `:prim_file` bypasses the Erlang file server, it loses the file server's read-ahead buffering. For sequential reads within a worker's range, `:file.pread` can be faster because the file server batches reads.
+
+The lesson: **more sophisticated is not always faster**. The fixed-partition approach (Section 7) is simpler, has less coordination overhead, and leverages the file server's buffering. Work-stealing helps when task sizes vary wildly — but our chunks are uniform, so there's little straggler problem to solve.
+
+---
+
+## Summary of Incremental Optimizations
+
+```
+Combined:        |████████████████████████████████████████████████|  934ms  (Section 5 — our starting point)
++ Byte ranges:   |███████████████████████████|                      536ms  (Section 7 — pre-calc partitions)
++ Fast parser:   |██████████████████████████████|                   584ms  (Section 8 — single-pass parser)
++ Key copy:      |███████████████████████████|                      534ms  (Section 9 — binary.copy keys)
++ Proc dict:     |████████████████████|                             383ms  (Section 10 — process dictionary)
++ Dynamic queue: |█████████████████████|                            411ms  (Section 11 — work queue, slower)
+```
+
+| Step | 10M time | vs Combined | Key change |
+|---|---|---|---|
+| 5 — Combined | 934 ms | — | Binary parse + parallel |
+| 7 — Byte ranges | 536 ms | x1.74 | Pre-calculated worker ranges |
+| 8 — Fast parser | 584 ms | x1.60 | Single-pass binary scanner |
+| 9 — Key copy | 534 ms | x1.75 | `:binary.copy` for map keys |
+| 10 — Proc dict | 383 ms | **x2.44** | Process dictionary storage |
+| 11 — Dynamic queue | 411 ms | x2.27 | Work-stealing + `:prim_file` |
+
+Note: Sections 7-11 use self-reported elapsed (computation only, excludes ~450ms Elixir startup), while Section 5 uses wall clock. The "vs Combined" ratios compare wall clock to self-reported, so they reflect the improvement in total time including the measurement method change.
+
+**Best result**: Section 10 (proc-dict) — **383 ms** for 10M rows, **67.6 seconds** for 1 billion rows.
+
+The peak performance comes from **Section 10**, not Section 11. The process dictionary eliminates the last major overhead (HAMT copies), while the dynamic work queue adds coordination cost that outweighs its load-balancing benefit.
+
+### What didn't make the table
+
+**Section 6 (rounding)** changes output formatting only — no performance impact. It's included in all subsequent branches but isn't benchmarked separately.
+
+**Step 2 (profiling infrastructure)** from the codex branches added a `Prof` module for timing and memory diagnostics. It's infrastructure, not optimization — no separate `solve/` branch.
 
 ---
 
@@ -872,15 +1245,20 @@ Each section targeted a different layer, just like Course 02:
 | 3 | Data structure | Immutable HAMT copies → mutable ETS |
 | 4 | CPU utilization | 1 core → 10 cores |
 | 5 | All combined | Faster ops + more cores = multiplicative gains |
+| 7-8 | I/O + parsing | Sequential reads → pread; two-pass → single-pass |
+| 9 | Memory | Sub-binary retention → `:binary.copy` |
+| 10 | Data structure | HAMT Map → process dictionary (O(1)) |
+| 11 | Architecture | Fixed partitions → work-stealing (negative result) |
 
 ### The pattern repeats
 
 ```
-Course 02 (file generation):    47s → 13.6s → 2.7s    (x17.3)
-Course 03 (solving):            5.9s → 4.9s → 1.1s    (x5.5)
+Course 02 (file generation):    47s → 13.6s → 2.7s     (x17.3)
+Course 03 (solving, 10M):       6.0s → 0.93s → 0.38s   (x15.7)
+Course 03 (solving, 1B):        ~10min → ~68s            (x8.8)
 ```
 
-Same three levers: **batch I/O**, **reduce per-operation cost**, **parallelize**.
+Same three levers: **batch I/O**, **reduce per-operation cost**, **parallelize**. Then a fourth lever: **eliminate allocation overhead** (process dictionary).
 
 ### What we learned
 
@@ -889,26 +1267,86 @@ Same three levers: **batch I/O**, **reduce per-operation cost**, **parallelize**
 3. **Integers > Floats** — avoid float allocation by working with integers × 10
 4. **Local Maps > shared ETS** — in parallel code, per-task local state avoids contention
 5. **Chunked raw reads > File.stream!** — `:file.read` with `:raw` bypasses the I/O server bottleneck
-6. **Speedups multiply** — fixing different bottlenecks gives compounding improvement
+6. **Speedups compound** — fixing different bottlenecks gives compounding improvement
+7. **Process dictionary is the fastest Map** — O(1) mutable storage, safe when each Task owns its own
+8. **`:binary.copy` prevents memory leaks** — sub-binaries retain parent binaries; copy keys on first insert
+9. **Simpler can beat cleverer** — the dynamic work queue (Section 11) was slower than fixed partitions due to coordination overhead. Not every "improvement" improves performance
+10. **Measure before and after** — Section 7 (byte ranges) was slower at 10M rows but would improve at larger scales. Context matters
 
 ### How to reproduce
 
+Each `solve/` branch contains a standalone `lib/solve.exs` script. Sections 7-11 report their own elapsed time to stderr.
+
 ```bash
-# Section 1 — Baseline
-git checkout solve/baseline   && time mix run lib/solve.exs --file data/measurements.10000000.txt
+# Generate data files (if needed)
+elixir lib/create_measurements.exs --rows 1000        # 1K — correctness check
+elixir lib/create_measurements.exs --rows 10000000    # 10M — benchmarks
+elixir lib/create_measurements.exs --rows 1000000000  # 1B — full challenge
 
-# Section 2 — Binary parsing
-git checkout solve/binary-parsing && time mix run lib/solve.exs --file data/measurements.10000000.txt
+# ──────────────────────────────────────────────────────
+# Sections 1-5: Isolated optimizations (use `time` for timing)
+# ──────────────────────────────────────────────────────
 
-# Section 3 — ETS
-git checkout solve/ets        && time mix run lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/baseline        && time elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/binary-parsing  && time elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/ets             && time elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/parallel        && time elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/combined        && time elixir lib/solve.exs --file data/measurements.10000000.txt
 
-# Section 4 — Parallel
-git checkout solve/parallel   && time mix run lib/solve.exs --file data/measurements.10000000.txt
+# ──────────────────────────────────────────────────────
+# Sections 6-11: Incremental optimizations (report elapsed to stderr)
+# ──────────────────────────────────────────────────────
 
-# Section 5 — Combined
-git checkout solve/combined   && time mix run lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/rounding        && elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/byte-ranges     && elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/fast-parser     && elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/key-copy        && elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/proc-dict       && elixir lib/solve.exs --file data/measurements.10000000.txt
+git checkout solve/dynamic-queue   && elixir lib/solve.exs --file data/measurements.10000000.txt
+
+# ──────────────────────────────────────────────────────
+# Full challenge (1B rows) — run on best versions
+# ──────────────────────────────────────────────────────
+
+git checkout solve/proc-dict       && elixir lib/solve.exs --file data/measurements.1000000000.txt
+git checkout solve/dynamic-queue   && elixir lib/solve.exs --file data/measurements.1000000000.txt
+
+# ──────────────────────────────────────────────────────
+# Verify correctness: diff any branch against baseline
+# ──────────────────────────────────────────────────────
+
+# Run baseline
+git show solve/combined:lib/solve.exs > /tmp/solve_baseline.exs
+elixir /tmp/solve_baseline.exs --file data/measurements.1000.txt > /tmp/baseline.txt 2>/dev/null
+
+# Run any branch
+git show solve/proc-dict:lib/solve.exs > /tmp/solve_test.exs
+elixir /tmp/solve_test.exs --file data/measurements.1000.txt > /tmp/test.txt 2>/dev/null
+
+# Compare (Sections 6+ use integer rounding, so small mean differences are expected)
+diff /tmp/baseline.txt /tmp/test.txt
+
+# ──────────────────────────────────────────────────────
+# Automated benchmark script (3 runs each, best time)
+# ──────────────────────────────────────────────────────
+
+for branch in solve/combined solve/rounding solve/byte-ranges solve/fast-parser \
+              solve/key-copy solve/proc-dict solve/dynamic-queue; do
+  echo "=== $branch ==="
+  for i in 1 2 3; do
+    git show "$branch:lib/solve.exs" > /tmp/bench_solve.exs 2>/dev/null
+    elixir /tmp/bench_solve.exs --file data/measurements.10000000.txt 2>&1 1>/dev/null \
+      | grep "Elapsed:" | head -1
+  done
+done
 ```
+
+**Benchmarking tips**:
+- Close other CPU-intensive apps during benchmarks
+- Run 3+ iterations and take the best time (coldest cache = worst time)
+- Sections 7-11 print `Elapsed: NNN ms` to stderr — this measures computation only, excluding Elixir startup
+- For Sections 1-5, use `time` — the wall clock includes ~2s of Elixir/mix startup overhead
+- The `--profile` flag (Sections 7-11) prints detailed memory and GC stats
 
 ---
 
